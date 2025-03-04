@@ -10,4 +10,27 @@ General point:
 - use diamond to substitute blastp
 - avoid using mysql, for its complex, and unknown trouble
 
-All script were generated using Grok.
+All scripts were generated using Grok.
+
+# how to use:
+conda create -n annocript python=3.9
+conda activate annocript
+conda install -c bioconda diamond blast cpat transdecoder
+pip install pyyaml pandas duckdb biopython
+
+git all content from this repo
+mkdir ./database
+### data preparation
+- put all your downloaded databses files into this directory.
+- from CPAT https://cpat.readthedocs.io/en/latest/, download Arabidopsis_hexamer.tsv and Arabidopsis_logit.RData, move into ./databases/
+## annotate your fasta
+- before formal run,
+  ```bash
+  python annocript.py
+  ```
+- then modify the parameters using vi or other tools as your favorate
+- run the tool, using commands like:
+```
+python annocript.py --fasta plant_transcripts.fasta --threads 16 --do_blastx --do_blastn --do_rpstblastn --do_lnc_prediction --do_dna2pep --do_build_output --extract_stats
+```
+find your results in the out directory.
