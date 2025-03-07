@@ -10,6 +10,7 @@ import tarfile
 from Bio import SeqIO
 from multiprocessing import Pool
 import logging
+import glob
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -84,9 +85,9 @@ def parse_arguments():
                         help="DIAMOND databases: 'sprot' (Swiss-Prot), 'trembl' (TrEMBL), 'uniref90' (UniRef90).")
     parser.add_argument("--do_db_creation", action="store_true", help="Create database (skipped with pre-downloaded files)")
     parser.add_argument("--do_execute_programs", action="store_true", help="Execute alignment programs", default=True)
-    parser.add_argument("--do_blastx", action="store_true", help="Run DIAMOND BLASTX", default=True)
-    parser.add_argument("--do_blastn", action="store_true", help="Run BLASTN", default=True)
-    parser.add_argument("--do_rpstblastn", action="store_true", help="Run RPSBLASTN", default=True)
+    parser.add_argument("--do_blastx", action="store_true", help="Run DIAMOND BLASTX against sprot or trembl or uniref90", default=True)
+    parser.add_argument("--do_blastn", action="store_true", help="Run BLASTN aginst ncRNA database", default=True)
+    parser.add_argument("--do_rpstblastn", action="store_true", help="Run RPSBLASTN against CDD domains", default=True)
     parser.add_argument("--do_lnc_prediction", action="store_true", help="Predict lncRNA with simple logic", default=True)
     parser.add_argument("--do_dna2pep", action="store_true", help="Search ORFs with TransDecoder", default=True)
     parser.add_argument("--do_build_output", action="store_true", help="Build final output", default=True)
@@ -100,24 +101,26 @@ def check_files(config, args):
     db_dir = os.path.abspath(args.db_dir)
     if not os.path.exists(args.fasta):
         raise FileNotFoundError(f"Input FASTA file not found: {args.fasta}")
-    required_files = [
-        config["database"]["uniprot_sprot"],
-        config["database"]["uniref90"],
-        config["database"]["uniprot_trembl"],
-        config["database"]["ncRNA"],
-        config["database"]["cdd"],
-        config["database"]["go_obo"],
-        config["database"]["enzyme_dat"],
-        config["database"]["pfam2go"]
-    ]
-    if args.do_function_description:
-        required_files.append(config["database"]["uniprot_dat"])
-    if args.do_kegg_annotation and "pathway_file" in config["database"]:
-        required_files.append(config["database"]["pathway_file"])
-    for f in required_files:
-        if not os.path.exists(os.path.join(db_dir, f)):
-            raise FileNotFoundError(f"Missing {f} in {db_dir}")
-    logging.info("All required database files found.")
+    
+    if args.do_execute_programs:  
+        required_files = [
+            config["database"]["uniprot_sprot"],
+            config["database"]["uniref90"],
+            config["database"]["uniprot_trembl"],
+            config["database"]["ncRNA"],
+            config["database"]["cdd"],
+            config["database"]["go_obo"],
+            config["database"]["enzyme_dat"],
+            config["database"]["pfam2go"]
+        ]
+        if args.do_function_description:
+            required_files.append(config["database"]["uniprot_dat"])
+        if args.do_kegg_annotation and "pathway_file" in config["database"]:
+            required_files.append(config["database"]["pathway_file"])
+        for f in required_files:
+            if not os.path.exists(os.path.join(db_dir, f)):
+                raise FileNotFoundError(f"Missing {f} in {db_dir}")
+        logging.info("All required database files found.")
 
 def build_index(db_file, output_db, tool, threads):
     db_file = os.path.abspath(db_file)
@@ -575,14 +578,18 @@ def extract_statistics(config, args, annotations_file):
 def main():
     args = parse_arguments()
     config = load_config(os.getcwd())
+    
 
     check_files(config, args)
 
-    if args.do_execute_programs:
-        diamond_out = blastn_out = rpstblastn_out = None
-        output_dir = config["output"]["dir"]
-        os.makedirs(output_dir, exist_ok=True)
+    diamond_out = None
+    blastn_out = None
+    rpstblastn_out = None
+    output_dir = config["output"]["dir"]
+    annotations_file = None
 
+    if args.do_execute_programs:
+        os.makedirs(output_dir, exist_ok=True)
         tasks = []
         db_map = {"sprot": "uniprot_sprot", "trembl": "uniprot_trembl", "uniref90": "uniref90"}
         diamond_out_files = []
@@ -622,25 +629,56 @@ def main():
                           os.path.join(output_dir, "rpstblastn.done"), threads_per_task))
             rpstblastn_out = rpstblastn_out_file
 
-        with Pool(processes=min(len(tasks), args.threads)) as pool:
-            results = pool.map(run_alignment, tasks)
-
-        diamond_out = [r for r in results if "diamond" in r] or diamond_out_files
-        blastn_out = blastn_out or next((r for r in results if "blastn" in r), None)
-        rpstblastn_out = rpstblastn_out or next((r for r in results if "rpstblastn" in r), None)
+        if tasks:
+            with Pool(processes=min(len(tasks), args.threads)) as pool:
+                results = pool.map(run_alignment, tasks)
+            diamond_out = [r for r in results if "diamond" in r] or diamond_out_files
+            blastn_out = blastn_out or next((r for r in results if "blastn" in r), None)
+            rpstblastn_out = rpstblastn_out or next((r for r in results if "rpstblastn" in r), None)
 
         if args.do_lnc_prediction and diamond_out and blastn_out:
             predict_lncRNA(config, args, diamond_out, blastn_out)
         if args.do_dna2pep:
             dna2pep(config, args)
 
-    annotations_file = None
-    if args.do_build_output:
-        idmapping_parquet = prepare_idmapping(config, args)
-        annotations_file = build_output(config, args, diamond_out, blastn_out, rpstblastn_out, idmapping_parquet)
+    if args.do_build_output or args.extract_stats:
+        os.makedirs(output_dir, exist_ok=True)
 
-    if args.extract_stats and annotations_file:
-        extract_statistics(config, args, annotations_file)
+        if not diamond_out:
+            diamond_out = glob.glob(os.path.join(output_dir, "*_diamond.out"))
+            if not diamond_out:
+                logging.error(f"No DIAMOND output files found in {output_dir}")
+                raise FileNotFoundError(f"No DIAMOND output files found in {output_dir}")
+            logging.info(f"Detected DIAMOND output files: {diamond_out}")
+
+        if not blastn_out:
+            blastn_out = os.path.join(output_dir, config["output"]["blastn_out"])
+            if not os.path.exists(blastn_out):
+                logging.warning(f"BLASTN output file not found: {blastn_out}. Proceeding without it.")
+                blastn_out = None
+            else:
+                logging.info(f"Detected BLASTN output file: {blastn_out}")
+
+        if not rpstblastn_out:
+            rpstblastn_out = os.path.join(output_dir, config["output"]["rpstblastn_out"])
+            if not os.path.exists(rpstblastn_out):
+                logging.warning(f"RPS-BLASTN output file not found: {rpstblastn_out}. Proceeding without it.")
+                rpstblastn_out = None
+            else:
+                logging.info(f"Detected RPS-BLASTN output file: {rpstblastn_out}")
+
+        if args.do_build_output:
+            idmapping_parquet = prepare_idmapping(config, args)
+            annotations_file = build_output(config, args, diamond_out, blastn_out, rpstblastn_out, idmapping_parquet)
+
+        if args.extract_stats:
+            if not annotations_file:
+                annotations_file = os.path.join(output_dir, config["output"]["annotations"])
+                if not os.path.exists(annotations_file):
+                    logging.error(f"Annotations file not found: {annotations_file}")
+                    raise FileNotFoundError(f"Annotations file not found: {annotations_file}")
+                logging.info(f"Detected annotations file: {annotations_file}")
+            extract_statistics(config, args, annotations_file)
 
 if __name__ == "__main__":
     main()
