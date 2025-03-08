@@ -17,6 +17,8 @@ import hashlib
 from pathlib import Path
 import pyfaidx
 import time
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -238,15 +240,44 @@ def dna2pep(config, args):
 def prepare_idmapping(config, args):
     db_dir = args.db_dir
     idmapping_gz = os.path.join(db_dir, config["database"]["idmapping"])
-    cache_dir = config["output"]["cache_dir"]
-    os.makedirs(cache_dir, exist_ok=True)
-    idmapping_parquet = os.path.join(cache_dir, "idmapping.parquet")
-    if os.path.exists(idmapping_parquet) and os.path.getmtime(idmapping_parquet) > os.path.getmtime(idmapping_gz):
+    idmapping_parquet = os.path.join(db_dir, "idmapping.parquet")
+    if os.path.exists(idmapping_parquet):
         logging.info(f"ID mapping already prepared: {idmapping_parquet}")
         return idmapping_parquet
 
-    df = dd.read_csv(idmapping_gz, sep="\t", header=None, names=["uniprot_id", "type", "value"], dtype=str, compression="gzip")
-    df.to_parquet(idmapping_parquet, engine="pyarrow", compression="snappy")
+    chunk_size = 10_000_000
+    schema = None
+    writer = None
+
+    # Define all 22 columns from UniProt idmapping_selected.tab.gz
+    column_names = [
+        "UniProtKB_AC", "UniProtKB_ID", "GeneID", "RefSeq", "GI", "PDB", "GO", "UniRef100",
+        "UniRef90", "UniRef50", "UniParc", "PIR", "NCBI_taxon", "MIM", "UniGene", "PubMed",
+        "EMBL", "EMBL_CDS", "Ensembl", "Ensembl_TRS", "Ensembl_PRO", "Additional_PubMed"
+    ]
+
+    try:
+        for i, chunk in enumerate(pd.read_csv(
+            idmapping_gz,
+            sep="\t",
+            header=None,
+            names=column_names,
+            dtype=str,
+            compression="gzip",
+            chunksize=chunk_size
+        )):
+            table = pa.Table.from_pandas(chunk)
+            if i == 0:
+                schema = table.schema
+                writer = pq.ParquetWriter(idmapping_parquet, schema, compression="snappy")
+                writer.write_table(table)
+            else:
+                table = table.cast(schema)
+                writer.write_table(table)
+            logging.info(f"Processed chunk {i + 1} with {len(chunk)} rows")
+    finally:
+        if writer:
+            writer.close()
     logging.info(f"ID mapping prepared: {idmapping_parquet}")
     return idmapping_parquet
 
@@ -262,8 +293,9 @@ def cached_parse(file_path, parse_func, cache_file):
 def parse_uniprot_dat(dat_file):
     def parse(dat_file):
         descriptions = {}
+        ec_numbers = {}
         with gzip.open(dat_file, "rt") as f:
-            uniprot_id, desc = None, []
+            uniprot_id, desc, ec = None, [], []
             for line in f:
                 if line.startswith("ID"):
                     uniprot_id = line.split()[1]
@@ -271,12 +303,24 @@ def parse_uniprot_dat(dat_file):
                     desc.append(line.split("=", 1)[1].strip(";"))
                 elif line.startswith("CC   -!- FUNCTION:"):
                     desc.append(line.split(":", 1)[1].strip())
+                elif line.startswith("DR   EC;"):
+                    ec.append(line.split(";")[1].strip())
                 elif line.startswith("//"):
-                    if uniprot_id and desc:
-                        descriptions[uniprot_id] = " ".join(desc)
-                    uniprot_id, desc = None, []
-        return descriptions
-    return cached_parse(dat_file, parse, dat_file.replace(".dat.gz", ".pickle"))
+                    if uniprot_id:
+                        if desc:
+                            descriptions[uniprot_id] = " ".join(desc)
+                        if ec:
+                            ec_numbers[uniprot_id] = ";".join(ec)
+                    uniprot_id, desc, ec = None, [], []
+        return descriptions, ec_numbers
+    cache_file = dat_file.replace(".dat.gz", ".pickle")
+    if os.path.exists(cache_file) and os.path.getmtime(cache_file) > os.path.getmtime(dat_file):
+        with open(cache_file, "rb") as f:
+            return pickle.load(f)
+    result = parse(dat_file)
+    with open(cache_file, "wb") as f:
+        pickle.dump(result, f)
+    return result
 
 def parse_go_obo(obo_file):
     def parse(obo_file):
@@ -362,7 +406,17 @@ def build_output(config, args, diamond_out_files, blastn_out, rpstblastn_out, id
     conn.execute("CREATE TABLE IF NOT EXISTS diamond (qseqid VARCHAR, sseqid VARCHAR, pident FLOAT, length INT, mismatch INT, gapopen INT, qstart INT, qend INT, sstart INT, send INT, evalue DOUBLE, bitscore FLOAT)")
     conn.execute("CREATE TABLE IF NOT EXISTS blastn (qseqid VARCHAR, sseqid VARCHAR, pident FLOAT, length INT, mismatch INT, gapopen INT, qstart INT, qend INT, sstart INT, send INT, evalue DOUBLE, bitscore FLOAT)")
     conn.execute("CREATE TABLE IF NOT EXISTS rpstblastn (qseqid VARCHAR, sseqid VARCHAR, pident FLOAT, length INT, mismatch INT, gapopen INT, qstart INT, qend INT, sstart INT, send INT, evalue DOUBLE, bitscore FLOAT)")
-    conn.execute("CREATE TABLE IF NOT EXISTS idmapping (uniprot_id VARCHAR, type VARCHAR, value VARCHAR)")
+    
+    # Create idmapping table with all 22 columns
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS idmapping (
+            UniProtKB_AC VARCHAR, UniProtKB_ID VARCHAR, GeneID VARCHAR, RefSeq VARCHAR, GI VARCHAR,
+            PDB VARCHAR, GO VARCHAR, UniRef100 VARCHAR, UniRef90 VARCHAR, UniRef50 VARCHAR,
+            UniParc VARCHAR, PIR VARCHAR, NCBI_taxon VARCHAR, MIM VARCHAR, UniGene VARCHAR,
+            PubMed VARCHAR, EMBL VARCHAR, EMBL_CDS VARCHAR, Ensembl VARCHAR, Ensembl_TRS VARCHAR,
+            Ensembl_PRO VARCHAR, Additional_PubMed VARCHAR
+        )
+    """)
 
     for diamond_file in diamond_out_files:
         conn.execute(f"INSERT INTO diamond SELECT * FROM read_csv_auto('{diamond_file}', delim='\t', header=false, columns={{'qseqid': 'VARCHAR', 'sseqid': 'VARCHAR', 'pident': 'FLOAT', 'length': 'INT', 'mismatch': 'INT', 'gapopen': 'INT', 'qstart': 'INT', 'qend': 'INT', 'sstart': 'INT', 'send': 'INT', 'evalue': 'DOUBLE', 'bitscore': 'FLOAT'}})")
@@ -382,30 +436,19 @@ def build_output(config, args, diamond_out_files, blastn_out, rpstblastn_out, id
     query = """
     SELECT d.qseqid, d.sseqid AS protein, d.evalue, d.bitscore, b.sseqid AS ncRNA, b.evalue AS nc_evalue,
            r.sseqid AS domain, r.evalue AS domain_evalue,
-           GROUP_CONCAT(DISTINCT gm.value) AS go_ids,
-           GROUP_CONCAT(DISTINCT em.value) AS ec_numbers,
-           GROUP_CONCAT(DISTINCT pm.value) AS pfam_ids
+           im.GO AS go_ids,
+           im.Pfam AS pfam_ids
     """
     if args.do_kegg_annotation or args.do_extended_annotation:
-        query += ", GROUP_CONCAT(DISTINCT km.value) AS kegg_ids"
+        query += ", im.KEGG AS kegg_ids"
     if args.do_extended_annotation:
-        query += ", GROUP_CONCAT(DISTINCT tm.value) AS tair_ids, GROUP_CONCAT(DISTINCT um.value) AS unipathway_ids"
+        query += ", im.TAIR AS tair_ids, im.UniPathway AS unipathway_ids"
     query += """
     FROM diamond_best d
     LEFT JOIN blastn b ON d.qseqid = b.qseqid
     LEFT JOIN rpstblastn r ON d.qseqid = r.qseqid
-    LEFT JOIN idmapping gm ON d.sseqid = gm.uniprot_id AND gm.type = 'GO'
-    LEFT JOIN idmapping em ON d.sseqid = em.uniprot_id AND em.type = 'EC'
-    LEFT JOIN idmapping pm ON d.sseqid = pm.uniprot_id AND pm.type = 'Pfam'
+    LEFT JOIN idmapping im ON d.sseqid = im.UniProtKB_AC
     """
-    if args.do_kegg_annotation or args.do_extended_annotation:
-        query += "LEFT JOIN idmapping km ON d.sseqid = km.uniprot_id AND km.type = 'KEGG'"
-    if args.do_extended_annotation:
-        query += """
-        LEFT JOIN idmapping tm ON d.sseqid = tm.uniprot_id AND tm.type = 'TAIR'
-        LEFT JOIN idmapping um ON d.sseqid = um.uniprot_id AND um.type = 'UniPathway'
-        """
-    query += "GROUP BY d.qseqid, d.sseqid, d.evalue, d.bitscore, b.sseqid, b.evalue, r.sseqid, r.evalue"
 
     result = conn.execute(query).fetchdf()
 
@@ -414,7 +457,11 @@ def build_output(config, args, diamond_out_files, blastn_out, rpstblastn_out, id
         enzyme_data = executor.submit(parse_enzyme_dat, os.path.join(args.db_dir, config["database"]["enzyme_dat"])).result()
         cdd_data = executor.submit(parse_cdd_metadata, os.path.join(args.db_dir, config["database"]["cdd"]), os.path.join(args.db_dir, "cdd")).result()
         pfam_to_go = executor.submit(parse_pfam2go, os.path.join(args.db_dir, config["database"]["pfam2go"])).result()
+        uniprot_data = executor.submit(parse_uniprot_dat, os.path.join(args.db_dir, config["database"]["uniprot_dat"])).result()
+        descriptions, ec_numbers = uniprot_data
 
+    # Add EC numbers and descriptions
+    result["ec_numbers"] = result["protein"].apply(lambda x: ec_numbers.get(x.split("|")[1] if "|" in x else x, None))
     result["go_descriptions"] = result["go_ids"].apply(lambda x: map_go_terms(x, go_terms) if pd.notna(x) else None)
     result["enzyme_descriptions"] = result["ec_numbers"].apply(lambda x: map_enzyme(x, enzyme_data) if pd.notna(x) else None)
     result["domain_descriptions"] = result["domain"].apply(lambda x: map_cdd_domains(x, cdd_data) if pd.notna(x) else None)
@@ -426,7 +473,6 @@ def build_output(config, args, diamond_out_files, blastn_out, rpstblastn_out, id
         result["kegg_pathways"] = result["kegg_ids"].apply(lambda x: map_pathways(x, pathways) if pd.notna(x) else None)
 
     if args.do_function_description:
-        descriptions = parse_uniprot_dat(os.path.join(args.db_dir, config["database"]["uniprot_dat"]))
         result["function_description"] = result["protein"].apply(lambda x: descriptions.get(x.split("|")[1] if "|" in x else x, "No description"))
 
     result.to_csv(annotations_file, sep="\t", index=False)
@@ -443,22 +489,24 @@ def build_output(config, args, diamond_out_files, blastn_out, rpstblastn_out, id
     return annotations_file
 
 def map_go_terms(go_ids, go_terms):
-    return ";".join([f"{gid} ({go_terms.get(gid, 'Unknown')})" for gid in go_ids.split(",")])
+    return ";".join([f"{gid} ({go_terms.get(gid, 'Unknown')})" for gid in go_ids.split(";")])
 
 def map_enzyme(ec_numbers, enzyme_data):
-    return ";".join([f"{ec} ({enzyme_data.get(ec, 'Unknown')})" for ec in ec_numbers.split(",")])
+    if not ec_numbers:
+        return None
+    return ";".join([f"{ec} ({enzyme_data.get(ec, 'Unknown')})" for ec in ec_numbers.split(";")])
 
 def map_cdd_domains(domain, cdd_data):
     return f"{domain} ({cdd_data.get(domain.split('.')[0], 'Unknown')})"
 
 def infer_go_from_pfam(pfam_ids, pfam_to_go, go_terms):
     inferred_go = set()
-    for pfam in pfam_ids.split(","):
+    for pfam in pfam_ids.split(";"):
         inferred_go.update(pfam_to_go.get(pfam, []))
     return ";".join([f"{gid} ({go_terms.get(gid, 'Unknown')})" for gid in inferred_go]) if inferred_go else None
 
 def map_pathways(kegg_ids, pathways):
-    return ";".join([f"{kid} ({pathways.get(kid.split(':')[-1], 'Unknown')})" for kid in kegg_ids.split(",")])
+    return ";".join([f"{kid} ({pathways.get(kid.split(':')[-1], 'Unknown')})" for kid in kegg_ids.split(";")])
 
 def extract_statistics(config, args, annotations_file):
     stats_dir = config["output"]["stats_dir"]
