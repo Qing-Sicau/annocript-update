@@ -3,7 +3,6 @@ import subprocess
 import argparse
 import yaml
 import pandas as pd
-import duckdb
 import gzip
 import shutil
 import tarfile
@@ -11,11 +10,12 @@ from Bio import SeqIO
 from multiprocessing import Pool
 import logging
 import glob
+import mysql.connector
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Default configuration
+# Default configuration with MySQL section added
 DEFAULT_CONFIG = {
     "fasta_file": "input.fasta",
     "database": {
@@ -31,6 +31,13 @@ DEFAULT_CONFIG = {
         "go_obo": "go.obo",
         "enzyme_dat": "enzyme.dat",
         "pfam2go": "pfam2go.txt"
+    },
+    "mysql": {
+        "host": "localhost",
+        "port": 3306,
+        "user": "pasa_write",
+        "password": "pasa_write_pwd",
+        "database": "annocript_db"
     },
     "diamond": {
         "evalue": 1e-5,
@@ -63,6 +70,7 @@ DEFAULT_CONFIG = {
 }
 
 def generate_config_template(user_dir):
+    """Generate a default config file if it doesn't exist."""
     config_path = os.path.join(user_dir, "annocript_config.yaml")
     if not os.path.exists(config_path):
         with open(config_path, "w") as f:
@@ -71,12 +79,14 @@ def generate_config_template(user_dir):
         exit(0)
 
 def load_config(user_dir):
+    """Load the configuration file, generating it if missing."""
     config_path = os.path.join(user_dir, "annocript_config.yaml")
     generate_config_template(user_dir)
     with open(config_path) as f:
         return yaml.safe_load(f)
 
 def parse_arguments():
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Annocript: Plant Transcriptome Annotation Tool with Checkpoints")
     parser.add_argument("--fasta", help="Input FASTA file", default=DEFAULT_CONFIG["fasta_file"])
     parser.add_argument("--db_dir", help="Database directory", default=DEFAULT_CONFIG["database"]["source_dir"])
@@ -85,10 +95,10 @@ def parse_arguments():
                         help="DIAMOND databases: 'sprot' (Swiss-Prot), 'trembl' (TrEMBL), 'uniref90' (UniRef90).")
     parser.add_argument("--do_db_creation", action="store_true", help="Create database (skipped with pre-downloaded files)")
     parser.add_argument("--do_execute_programs", action="store_true", help="Execute alignment programs", default=True)
-    parser.add_argument("--do_blastx", action="store_true", help="Run DIAMOND BLASTX against sprot or trembl or uniref90", default=True)
-    parser.add_argument("--do_blastn", action="store_true", help="Run BLASTN aginst ncRNA database", default=True)
+    parser.add_argument("--do_blastx", action="store_true", help="Run DIAMOND BLASTX", default=True)
+    parser.add_argument("--do_blastn", action="store_true", help="Run BLASTN against ncRNA database", default=True)
     parser.add_argument("--do_rpstblastn", action="store_true", help="Run RPSBLASTN against CDD domains", default=True)
-    parser.add_argument("--do_lnc_prediction", action="store_true", help="Predict lncRNA with simple logic", default=True)
+    parser.add_argument("--do_lnc_prediction", action="store_true", help="Predict lncRNA", default=True)
     parser.add_argument("--do_dna2pep", action="store_true", help="Search ORFs with TransDecoder", default=True)
     parser.add_argument("--do_build_output", action="store_true", help="Build final output", default=True)
     parser.add_argument("--extract_stats", action="store_true", help="Generate statistics", default=True)
@@ -98,31 +108,28 @@ def parse_arguments():
     return parser.parse_args()
 
 def check_files(config, args):
+    """Check if required files exist."""
     db_dir = os.path.abspath(args.db_dir)
     if not os.path.exists(args.fasta):
         raise FileNotFoundError(f"Input FASTA file not found: {args.fasta}")
-    
-    if args.do_execute_programs:  
+
+    if args.do_execute_programs:
         required_files = [
-            config["database"]["uniprot_sprot"],
-            config["database"]["uniref90"],
-            config["database"]["uniprot_trembl"],
-            config["database"]["ncRNA"],
-            config["database"]["cdd"],
-            config["database"]["go_obo"],
-            config["database"]["enzyme_dat"],
-            config["database"]["pfam2go"]
+            "uniprot_sprot", "uniref90", "uniprot_trembl", "ncRNA", "cdd",
+            "go_obo", "enzyme_dat", "pfam2go"
         ]
         if args.do_function_description:
-            required_files.append(config["database"]["uniprot_dat"])
+            required_files.append("uniprot_dat")
         if args.do_kegg_annotation and "pathway_file" in config["database"]:
-            required_files.append(config["database"]["pathway_file"])
-        for f in required_files:
-            if not os.path.exists(os.path.join(db_dir, f)):
-                raise FileNotFoundError(f"Missing {f} in {db_dir}")
+            required_files.append("pathway_file")
+
+        missing_files = [f for f in required_files if not os.path.exists(os.path.join(db_dir, config["database"][f]))]
+        if missing_files:
+            raise FileNotFoundError(f"Missing files in {db_dir}: {', '.join(missing_files)}")
         logging.info("All required database files found.")
 
 def build_index(db_file, output_db, tool, threads):
+    """Build index for alignment tools."""
     db_file = os.path.abspath(db_file)
     if not os.path.exists(db_file):
         raise FileNotFoundError(f"Database file not found: {db_file}")
@@ -135,15 +142,14 @@ def build_index(db_file, output_db, tool, threads):
             logging.info(f"Uncompressed {db_file} to {uncompressed}")
         db_file = uncompressed
 
-    index_exists = False
     if tool == "diamond":
         index_file = f"{output_db}.dmnd"
-        index_exists = os.path.exists(index_file)
     elif tool == "blast":
         index_file = f"{output_db}.nhr"
-        index_exists = os.path.exists(index_file) and os.path.exists(f"{output_db}.nin") and os.path.exists(f"{output_db}.nsq")
+    else:
+        raise ValueError(f"Unsupported tool: {tool}")
 
-    if index_exists and os.path.getmtime(index_file) >= os.path.getmtime(db_file):
+    if os.path.exists(index_file):
         logging.info(f"Index already exists and is up-to-date: {index_file}")
         return output_db
 
@@ -155,48 +161,30 @@ def build_index(db_file, output_db, tool, threads):
         cmd = ["makeblastdb", "-in", db_file, "-dbtype", "nucl", "-out", output_db]
         subprocess.run(cmd, check=True)
         logging.info(f"BLAST index built: {output_db}")
+
     return output_db
 
 def run_alignment(args_tuple):
-    tool, config, args, db_index, output_file, checkpoint_file, threads_per_task = args_tuple
+    """Run alignment tools with checkpointing."""
+    tool, config, args, db_index, output_file, checkpoint_file, threads = args_tuple
     if os.path.exists(checkpoint_file):
         logging.info(f"{tool} alignment already completed: {output_file}")
         return output_file
 
+    cmd_base = {
+        "diamond": ["diamond", "blastx", "--query", args.fasta, "--db", db_index, "--out", output_file,
+                    "--evalue", str(config["diamond"]["evalue"]), "--threads", str(threads),
+                    "--outfmt", str(config["diamond"]["outfmt"])] + (["--sensitive"] if config["diamond"]["sensitive"] else []),
+        "blastn": ["blastn", "-query", args.fasta, "-db", db_index, "-out", output_file,
+                   "-evalue", str(config["blastn"]["evalue"]), "-num_threads", str(threads),
+                   "-outfmt", str(config["blastn"]["outfmt"])],
+        "rpstblastn": ["rpstblastn", "-query", args.fasta, "-db", db_index, "-out", output_file,
+                       "-evalue", str(config["rpstblastn"]["evalue"]), "-num_threads", str(threads),
+                       "-outfmt", str(config["rpstblastn"]["outfmt"])]
+    }
+
     try:
-        if tool == "diamond":
-            cmd = [
-                "diamond", "blastx",
-                "--query", args.fasta,
-                "--db", db_index,
-                "--out", output_file,
-                "--evalue", str(config["diamond"]["evalue"]),
-                "--threads", str(threads_per_task),
-                "--outfmt", str(config["diamond"]["outfmt"])
-            ]
-            if config["diamond"]["sensitive"]:
-                cmd.append("--sensitive")
-        elif tool == "blastn":
-            cmd = [
-                "blastn",
-                "-query", args.fasta,
-                "-db", db_index,
-                "-out", output_file,
-                "-evalue", str(config["blastn"]["evalue"]),
-                "-num_threads", str(threads_per_task),
-                "-outfmt", str(config["blastn"]["outfmt"])
-            ]
-        elif tool == "rpstblastn":
-            cmd = [
-                "rpstblastn",
-                "-query", args.fasta,
-                "-db", db_index,
-                "-out", output_file,
-                "-evalue", str(config["rpstblastn"]["evalue"]),
-                "-num_threads", str(threads_per_task),
-                "-outfmt", str(config["rpstblastn"]["outfmt"])
-            ]
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd_base[tool], check=True)
         with open(checkpoint_file, "w") as f:
             f.write("done")
         logging.info(f"{tool} alignment completed: {output_file}")
@@ -205,6 +193,7 @@ def run_alignment(args_tuple):
         raise RuntimeError(f"{tool} failed with error: {e}")
 
 def predict_lncRNA(config, args, diamond_out_files, blastn_out):
+    """Predict long non-coding RNAs."""
     output_dir = config["output"]["dir"]
     lnc_file = os.path.join(output_dir, "lncRNA.fasta")
     checkpoint_file = os.path.join(output_dir, "lncRNA.done")
@@ -220,17 +209,17 @@ def predict_lncRNA(config, args, diamond_out_files, blastn_out):
 
     with open(lnc_file, "w") as out:
         for record in SeqIO.parse(args.fasta, "fasta"):
-            if (record.id not in diamond_hits and
-                record.id in blastn_hits and
+            if (record.id not in diamond_hits and record.id in blastn_hits and
                 len(record.seq) >= config["lncRNA"]["min_length"]):
                 SeqIO.write(record, out, "fasta")
 
     with open(checkpoint_file, "w") as f:
         f.write("done")
-    logging.info(f"Simple lncRNA prediction completed: {lnc_file}")
+    logging.info(f"lncRNA prediction completed: {lnc_file}")
     return lnc_file
 
 def dna2pep(config, args):
+    """Run TransDecoder to predict ORFs."""
     output_dir = config["output"]["dir"]
     transdecoder_dir = os.path.join(output_dir, "transdecoder")
     checkpoint_file = os.path.join(output_dir, "dna2pep.done")
@@ -241,22 +230,10 @@ def dna2pep(config, args):
         return orf_file
 
     os.makedirs(transdecoder_dir, exist_ok=True)
-
-    cmd = [
-        "TransDecoder.LongOrfs",
-        "-t", args.fasta,
-        "-m", str(config["transdecoder"]["min_length"]),
-        "--output_dir", transdecoder_dir
-    ]
-    subprocess.run(cmd, check=True)
-
-    cmd = [
-        "TransDecoder.Predict",
-        "-t", args.fasta,
-        "--output_dir", transdecoder_dir,
-        "--single_best_only"
-    ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(["TransDecoder.LongOrfs", "-t", args.fasta, "-m", str(config["transdecoder"]["min_length"]),
+                    "--output_dir", transdecoder_dir], check=True)
+    subprocess.run(["TransDecoder.Predict", "-t", args.fasta, "--output_dir", transdecoder_dir, "--single_best_only"],
+                   check=True)
 
     with open(checkpoint_file, "w") as f:
         f.write("done")
@@ -264,25 +241,25 @@ def dna2pep(config, args):
     return orf_file
 
 def prepare_idmapping(config, args):
+    """Prepare ID mapping file in Parquet format."""
     db_dir = args.db_dir
     idmapping_gz = os.path.join(db_dir, config["database"]["idmapping"])
     idmapping_parquet = os.path.join(db_dir, "idmapping.parquet")
 
     if os.path.exists(idmapping_parquet):
-        logging.info(f"idmapping already prepared: {idmapping_parquet}")
+        logging.info(f"ID mapping already prepared: {idmapping_parquet}")
         return idmapping_parquet
 
-    df = pd.read_csv(idmapping_gz, sep="\t", header=None,
-                     names=["uniprot_id", "type", "value"], compression="gzip")
+    df = pd.read_csv(idmapping_gz, sep="\t", header=None, names=["uniprot_id", "type", "value"], compression="gzip")
     df.to_parquet(idmapping_parquet)
-    logging.info(f"idmapping prepared: {idmapping_parquet}")
+    logging.info(f"ID mapping prepared: {idmapping_parquet}")
     return idmapping_parquet
 
 def parse_uniprot_dat(dat_file):
+    """Parse UniProt .dat file for functional descriptions."""
     descriptions = {}
     with gzip.open(dat_file, "rt") as f:
-        uniprot_id = None
-        desc = []
+        uniprot_id, desc = None, []
         for line in f:
             if line.startswith("ID"):
                 uniprot_id = line.split()[1]
@@ -293,40 +270,35 @@ def parse_uniprot_dat(dat_file):
             elif line.startswith("//"):
                 if uniprot_id and desc:
                     descriptions[uniprot_id] = " ".join(desc)
-                uniprot_id = None
-                desc = []
+                uniprot_id, desc = None, []
     return descriptions
 
 def parse_go_obo(obo_file):
+    """Parse GO ontology file."""
     go_terms = {}
-    current_term = {}
-    
-    with open(obo_file, "r") as f:
+    with open(obo_file) as f:
+        current_term = {}
         for line in f:
             line = line.strip()
             if line == "[Term]":
-                if current_term.get("id") and current_term.get("name"):
+                if "id" in current_term and "name" in current_term:
                     go_terms[current_term["id"]] = current_term["name"]
                 current_term = {}
             elif line.startswith("id:"):
                 current_term["id"] = line.split("id: ")[1]
             elif line.startswith("name:"):
                 current_term["name"] = line.split("name: ")[1]
-    
-    if current_term.get("id") and current_term.get("name"):
+    if "id" in current_term and "name" in current_term:
         go_terms[current_term["id"]] = current_term["name"]
-    
     logging.info(f"Parsed {len(go_terms)} GO terms from {obo_file}")
     return go_terms
 
 def parse_enzyme_dat(enzyme_file):
+    """Parse enzyme.dat file."""
     enzyme_data = {}
-    current_ec = None
-    description = []
-    
-    with open(enzyme_file, "r") as f:
+    with open(enzyme_file) as f:
+        current_ec, description = None, []
         for line in f:
-            line = line.rstrip()
             if line.startswith("ID"):
                 if current_ec and description:
                     enzyme_data[current_ec] = " ".join(description)
@@ -337,45 +309,42 @@ def parse_enzyme_dat(enzyme_file):
             elif line.startswith("//"):
                 if current_ec and description:
                     enzyme_data[current_ec] = " ".join(description)
-                current_ec = None
-                description = []
-    
+                current_ec, description = None, []
     logging.info(f"Parsed {len(enzyme_data)} enzyme entries from {enzyme_file}")
     return enzyme_data
 
 def parse_cdd_metadata(cdd_tar_file, extract_dir):
+    """Parse CDD metadata from tarball."""
     cdd_data = {}
     if not os.path.exists(extract_dir):
         with tarfile.open(cdd_tar_file, "r:gz") as tar:
             tar.extractall(extract_dir)
         logging.info(f"Extracted {cdd_tar_file} to {extract_dir}")
-    
-    for smp_file in os.listdir(extract_dir):
-        if smp_file.endswith(".smp"):
-            with open(os.path.join(extract_dir, smp_file), "r") as f:
-                for line in f:
-                    if line.startswith(">"):
-                        parts = line[1:].strip().split()
-                        domain_id = parts[0]  # e.g., cd00001
-                        desc = " ".join(parts[1:])
-                        cdd_data[domain_id] = desc
+
+    for smp_file in glob.glob(os.path.join(extract_dir, "*.smp")):
+        with open(smp_file) as f:
+            for line in f:
+                if line.startswith(">"):
+                    parts = line[1:].strip().split()
+                    cdd_data[parts[0]] = " ".join(parts[1:])
     logging.info(f"Parsed {len(cdd_data)} CDD entries from {extract_dir}")
     return cdd_data
 
 def parse_pfam2go(pfam2go_file):
+    """Parse Pfam-to-GO mappings."""
     pfam_to_go = {}
-    with open(pfam2go_file, "r") as f:
+    with open(pfam2go_file) as f:
         for line in f:
             if line.startswith("Pfam:"):
                 parts = line.strip().split(" > ")
-                pfam_part = parts[0].split()
-                pfam_id = pfam_part[0].replace("Pfam:", "")  # e.g., PF00001
+                pfam_id = parts[0].split()[0].replace("Pfam:", "")
                 go_terms = parts[1].split(" ; ")
-                pfam_to_go[pfam_id] = [go.split()[-1] for go in go_terms]  # Extract GO IDs
+                pfam_to_go[pfam_id] = [go.split()[-1] for go in go_terms]
     logging.info(f"Parsed {len(pfam_to_go)} Pfam-to-GO mappings from {pfam2go_file}")
     return pfam_to_go
 
 def build_output(config, args, diamond_out_files, blastn_out, rpstblastn_out, idmapping_parquet):
+    """Build final annotations using MySQL."""
     output_dir = config["output"]["dir"]
     annotations_file = os.path.join(output_dir, config["output"]["annotations"])
     gff_dir = config["output"]["gff_dir"]
@@ -386,73 +355,84 @@ def build_output(config, args, diamond_out_files, blastn_out, rpstblastn_out, id
         return annotations_file
 
     os.makedirs(gff_dir, exist_ok=True)
+    conn = mysql.connector.connect(**config["mysql"])
+    cursor = conn.cursor()
+    logging.info("Connected to MySQL database")
 
-    conn = duckdb.connect()
+    cursor.execute(f"CREATE DATABASE IF NOT EXISTS {config['mysql']['database']}")
+    cursor.execute(f"USE {config['mysql']['database']}")
 
-    diamond_tables = []
-    for i, diamond_file in enumerate(diamond_out_files):
-        conn.execute(f"""
-            CREATE TABLE diamond_{i} AS 
-            SELECT * FROM read_csv_auto('{diamond_file}', delim='\t', 
-                names=['qseqid', 'sseqid', 'pident', 'length', 'mismatch', 
-                       'gapopen', 'qstart', 'qend', 'sstart', 'send', 'evalue', 'bitscore'])
-        """)
-        diamond_tables.append(f"diamond_{i}")
+    # Define table creation queries
+    tables = {
+        "diamond": """
+            CREATE TABLE IF NOT EXISTS diamond (
+                qseqid VARCHAR(255), sseqid VARCHAR(255), pident FLOAT, length INT, mismatch INT, gapopen INT,
+                qstart INT, qend INT, sstart INT, send INT, evalue DOUBLE, bitscore FLOAT,
+                PRIMARY KEY (qseqid, sseqid)
+            )""",
+        "blastn": """
+            CREATE TABLE IF NOT EXISTS blastn (
+                qseqid VARCHAR(255), sseqid VARCHAR(255), pident FLOAT, length INT, mismatch INT, gapopen INT,
+                qstart INT, qend INT, sstart INT, send INT, evalue DOUBLE, bitscore FLOAT,
+                PRIMARY KEY (qseqid, sseqid)
+            )""",
+        "rpstblastn": """
+            CREATE TABLE IF NOT EXISTS rpstblastn (
+                qseqid VARCHAR(255), sseqid VARCHAR(255), pident FLOAT, length INT, mismatch INT, gapopen INT,
+                qstart INT, qend INT, sstart INT, send INT, evalue DOUBLE, bitscore FLOAT,
+                PRIMARY KEY (qseqid, sseqid)
+            )""",
+        "idmapping": """
+            CREATE TABLE IF NOT EXISTS idmapping (
+                uniprot_id VARCHAR(255), type VARCHAR(50), value VARCHAR(255), INDEX (uniprot_id, type)
+            )"""
+    }
+    for table, query in tables.items():
+        cursor.execute(query)
 
-    diamond_query = " UNION ALL ".join(f"SELECT * FROM {table}" for table in diamond_tables)
-    conn.execute(f"""
-        CREATE TABLE diamond AS 
-        SELECT qseqid, sseqid, pident, length, mismatch, gapopen, qstart, qend, sstart, send, evalue, bitscore
-        FROM ({diamond_query})
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY qseqid ORDER BY bitscore DESC) = 1
+    # Load data into tables
+    for diamond_file in diamond_out_files:
+        cursor.execute(f"LOAD DATA LOCAL INFILE '{diamond_file}' INTO TABLE diamond FIELDS TERMINATED BY '\t' "
+                       "(qseqid, sseqid, pident, length, mismatch, gapopen, qstart, qend, sstart, send, evalue, bitscore)")
+        logging.info(f"Loaded DIAMOND data from {diamond_file}")
+
+    if blastn_out:
+        cursor.execute(f"LOAD DATA LOCAL INFILE '{blastn_out}' INTO TABLE blastn FIELDS TERMINATED BY '\t' "
+                       "(qseqid, sseqid, pident, length, mismatch, gapopen, qstart, qend, sstart, send, evalue, bitscore)")
+        logging.info(f"Loaded BLASTN data from {blastn_out}")
+
+    if rpstblastn_out:
+        cursor.execute(f"LOAD DATA LOCAL INFILE '{rpstblastn_out}' INTO TABLE rpstblastn FIELDS TERMINATED BY '\t' "
+                       "(qseqid, sseqid, pident, length, mismatch, gapopen, qstart, qend, sstart, send, evalue, bitscore)")
+        logging.info(f"Loaded RPSBLASTN data from {rpstblastn_out}")
+
+    idmapping_tsv = os.path.splitext(idmapping_parquet)[0] + ".tsv"
+    if not os.path.exists(idmapping_tsv):
+        pd.read_parquet(idmapping_parquet).to_csv(idmapping_tsv, sep="\t", index=False)
+    cursor.execute(f"LOAD DATA LOCAL INFILE '{idmapping_tsv}' INTO TABLE idmapping FIELDS TERMINATED BY '\t' "
+                   "(uniprot_id, type, value)")
+    logging.info(f"Loaded IDmapping data from {idmapping_tsv}")
+
+    # Create best-match view
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS diamond_best AS
+        SELECT d.* FROM diamond d
+        INNER JOIN (SELECT qseqid, MAX(bitscore) AS max_bitscore FROM diamond GROUP BY qseqid) db
+        ON d.qseqid = db.qseqid AND d.bitscore = db.max_bitscore
     """)
 
-    conn.execute(f"""
-        CREATE TABLE blastn AS 
-        SELECT * FROM read_csv_auto('{blastn_out}', delim='\t', 
-            names=['qseqid', 'sseqid', 'pident', 'length', 'mismatch', 
-                   'gapopen', 'qstart', 'qend', 'sstart', 'send', 'evalue', 'bitscore'])
-    """)
-    conn.execute(f"""
-        CREATE TABLE rpstblastn AS 
-        SELECT * FROM read_csv_auto('{rpstblastn_out}', delim='\t', 
-            names=['qseqid', 'sseqid', 'pident', 'length', 'mismatch', 
-                   'gapopen', 'qstart', 'qend', 'sstart', 'send', 'evalue', 'bitscore'])
-    """)
-    conn.execute(f"CREATE TABLE idmapping AS SELECT * FROM '{idmapping_parquet}'")
-
-    # Parse additional data sources
-    go_obo_file = os.path.join(args.db_dir, config["database"]["go_obo"])
-    go_terms = parse_go_obo(go_obo_file)
-    
-    enzyme_file = os.path.join(args.db_dir, config["database"]["enzyme_dat"])
-    enzyme_data = parse_enzyme_dat(enzyme_file)
-    
-    cdd_dir = os.path.join(args.db_dir, "cdd")
-    cdd_data = parse_cdd_metadata(os.path.join(args.db_dir, config["database"]["cdd"]), cdd_dir)
-    
-    pfam2go_file = os.path.join(args.db_dir, config["database"]["pfam2go"])
-    pfam_to_go = parse_pfam2go(pfam2go_file)
-
+    # Construct main query
     query = """
-    SELECT d.qseqid, d.sseqid AS protein, d.evalue, d.bitscore,
-           b.sseqid AS ncRNA, b.evalue AS nc_evalue,
-           r.sseqid AS domain, r.evalue AS domain_evalue,
-           GROUP_CONCAT(DISTINCT gm.value) AS go_ids,
-           GROUP_CONCAT(DISTINCT em.value) AS ec_numbers,
-           GROUP_CONCAT(DISTINCT pm.value) AS pfam_ids
+    SELECT d.qseqid, d.sseqid AS protein, d.evalue, d.bitscore, b.sseqid AS ncRNA, b.evalue AS nc_evalue,
+           r.sseqid AS domain, r.evalue AS domain_evalue, GROUP_CONCAT(DISTINCT gm.value) AS go_ids,
+           GROUP_CONCAT(DISTINCT em.value) AS ec_numbers, GROUP_CONCAT(DISTINCT pm.value) AS pfam_ids
     """
     if args.do_kegg_annotation or args.do_extended_annotation:
-        query += """,
-           GROUP_CONCAT(DISTINCT km.value) AS kegg_ids
-        """
+        query += ", GROUP_CONCAT(DISTINCT km.value) AS kegg_ids"
     if args.do_extended_annotation:
-        query += """,
-           GROUP_CONCAT(DISTINCT tm.value) AS tair_ids,
-           GROUP_CONCAT(DISTINCT um.value) AS unipathway_ids
-        """
+        query += ", GROUP_CONCAT(DISTINCT tm.value) AS tair_ids, GROUP_CONCAT(DISTINCT um.value) AS unipathway_ids"
     query += """
-    FROM diamond d
+    FROM diamond_best d
     LEFT JOIN blastn b ON d.qseqid = b.qseqid
     LEFT JOIN rpstblastn r ON d.qseqid = r.qseqid
     LEFT JOIN idmapping gm ON d.sseqid = gm.uniprot_id AND gm.type = 'GO'
@@ -460,90 +440,81 @@ def build_output(config, args, diamond_out_files, blastn_out, rpstblastn_out, id
     LEFT JOIN idmapping pm ON d.sseqid = pm.uniprot_id AND pm.type = 'Pfam'
     """
     if args.do_kegg_annotation or args.do_extended_annotation:
-        query += """
-        LEFT JOIN idmapping km ON d.sseqid = km.uniprot_id AND km.type = 'KEGG'
-        """
+        query += "LEFT JOIN idmapping km ON d.sseqid = km.uniprot_id AND km.type = 'KEGG'"
     if args.do_extended_annotation:
         query += """
         LEFT JOIN idmapping tm ON d.sseqid = tm.uniprot_id AND tm.type = 'TAIR'
         LEFT JOIN idmapping um ON d.sseqid = um.uniprot_id AND um.type = 'UniPathway'
         """
-    query += "GROUP BY ALL"
+    query += "GROUP BY d.qseqid, d.sseqid, d.evalue, d.bitscore, b.sseqid, b.evalue, r.sseqid, r.evalue"
 
-    result = conn.execute(query).fetchdf()
+    cursor.execute(query)
+    columns = ["qseqid", "protein", "evalue", "bitscore", "ncRNA", "nc_evalue", "domain", "domain_evalue",
+               "go_ids", "ec_numbers", "pfam_ids"]
+    if args.do_kegg_annotation or args.do_extended_annotation:
+        columns.append("kegg_ids")
+    if args.do_extended_annotation:
+        columns.extend(["tair_ids", "unipathway_ids"])
+    result = pd.DataFrame(cursor.fetchall(), columns=columns)
 
-    # Map GO terms
-    def map_go_terms(go_ids):
-        if pd.isna(go_ids):
-            return None
-        return ";".join([f"{gid} ({go_terms.get(gid, 'Unknown')})" for gid in go_ids.split(",")])
-    result["go_descriptions"] = result["go_ids"].apply(map_go_terms)
+    # Parse additional annotations
+    go_terms = parse_go_obo(os.path.join(args.db_dir, config["database"]["go_obo"]))
+    enzyme_data = parse_enzyme_dat(os.path.join(args.db_dir, config["database"]["enzyme_dat"]))
+    cdd_data = parse_cdd_metadata(os.path.join(args.db_dir, config["database"]["cdd"]), os.path.join(args.db_dir, "cdd"))
+    pfam_to_go = parse_pfam2go(os.path.join(args.db_dir, config["database"]["pfam2go"]))
 
-    # Map EC numbers to enzyme descriptions
-    def map_enzyme(ec_numbers):
-        if pd.isna(ec_numbers):
-            return None
-        return ";".join([f"{ec} ({enzyme_data.get(ec, 'Unknown')})" for ec in ec_numbers.split(",")])
-    result["enzyme_descriptions"] = result["ec_numbers"].apply(map_enzyme)
+    result["go_descriptions"] = result["go_ids"].apply(lambda x: map_go_terms(x, go_terms) if pd.notna(x) else None)
+    result["enzyme_descriptions"] = result["ec_numbers"].apply(lambda x: map_enzyme(x, enzyme_data) if pd.notna(x) else None)
+    result["domain_descriptions"] = result["domain"].apply(lambda x: map_cdd_domains(x, cdd_data) if pd.notna(x) else None)
+    result["pfam_inferred_go"] = result["pfam_ids"].apply(lambda x: infer_go_from_pfam(x, pfam_to_go, go_terms) if pd.notna(x) else None)
 
-    # Map CDD domains
-    def map_cdd_domains(domain):
-        if pd.isna(domain):
-            return None
-        return f"{domain} ({cdd_data.get(domain.split('.')[0], 'Unknown')})"
-    result["domain_descriptions"] = result["domain"].apply(map_cdd_domains)
-
-    # Add Pfam-to-GO inferred GO terms
-    def infer_go_from_pfam(pfam_ids):
-        if pd.isna(pfam_ids):
-            return None
-        inferred_go = set()
-        for pfam in pfam_ids.split(","):
-            inferred_go.update(pfam_to_go.get(pfam, []))
-        return ";".join([f"{gid} ({go_terms.get(gid, 'Unknown')})" for gid in inferred_go]) if inferred_go else None
-    result["pfam_inferred_go"] = result["pfam_ids"].apply(infer_go_from_pfam)
-
-    if args.do_kegg_annotation and "pathway_file" in config["database"] and os.path.exists(os.path.join(args.db_dir, config["database"]["pathway_file"])):
-        pathway_file = os.path.join(args.db_dir, config["database"]["pathway_file"])
-        pathways = {}
-        with open(pathway_file) as f:
-            for line in f:
-                if line.startswith("PATH:"):
-                    parts = line.strip().split("\t")
-                    if len(parts) > 1:
-                        kegg_id = parts[0].replace("PATH:", "")
-                        pathways[kegg_id] = parts[1]
-        def map_pathways(kegg_ids):
-            if pd.isna(kegg_ids):
-                return None
-            return ";".join([f"{kid} ({pathways.get(kid.split(':')[-1], 'Unknown')})" for kid in kegg_ids.split(",")])
-        result["kegg_pathways"] = result["kegg_ids"].apply(map_pathways)
-    else:
-        result["kegg_pathways"] = result.get("kegg_ids", None)
+    if args.do_kegg_annotation and "pathway_file" in config["database"]:
+        pathways = {line.split("\t")[0].replace("PATH:", ""): line.split("\t")[1].strip()
+                    for line in open(os.path.join(args.db_dir, config["database"]["pathway_file"])) if line.startswith("PATH:")}
+        result["kegg_pathways"] = result["kegg_ids"].apply(lambda x: map_pathways(x, pathways) if pd.notna(x) else None)
 
     if args.do_function_description:
-        dat_file = os.path.join(args.db_dir, config["database"]["uniprot_dat"])
-        descriptions = parse_uniprot_dat(dat_file)
-        result["function_description"] = result["protein"].map(
-            lambda x: descriptions.get(x.split("|")[1] if "|" in x else x.split("_")[-1] if "UniRef90_" in x else x, "No description available")
-        )
+        descriptions = parse_uniprot_dat(os.path.join(args.db_dir, config["database"]["uniprot_dat"]))
+        result["function_description"] = result["protein"].map(lambda x: descriptions.get(x.split("|")[1] if "|" in x else x, "No description"))
 
     result.to_csv(annotations_file, sep="\t", index=False)
 
+    # Generate GFF3
     with open(os.path.join(gff_dir, "annotations.gff3"), "w") as gff:
         gff.write("##gff-version 3\n")
-        for _, row in result.iterrows():
-            if pd.notna(row["protein"]):
-                gff.write(f"{row['qseqid']}\tDIAMOND\tmatch\t{row['qstart']}\t{row['qend']}\t"
-                          f"{row['bitscore']}\t+\t.\tID={row['sseqid']};evalue={row['evalue']}\n")
+        cursor.execute("SELECT qseqid, sseqid, qstart, qend, bitscore, evalue FROM diamond_best WHERE sseqid IS NOT NULL")
+        for row in cursor.fetchall():
+            gff.write(f"{row[0]}\tDIAMOND\tmatch\t{row[2]}\t{row[3]}\t{row[4]}\t+\t.\tID={row[1]};evalue={row[5]}\n")
 
     with open(checkpoint_file, "w") as f:
         f.write("done")
+    conn.commit()
+    cursor.close()
     conn.close()
     logging.info(f"Output generated: {annotations_file}, GFF3 in {gff_dir}")
     return annotations_file
 
+# Helper functions for mappings
+def map_go_terms(go_ids, go_terms):
+    return ";".join([f"{gid} ({go_terms.get(gid, 'Unknown')})" for gid in go_ids.split(",")])
+
+def map_enzyme(ec_numbers, enzyme_data):
+    return ";".join([f"{ec} ({enzyme_data.get(ec, 'Unknown')})" for ec in ec_numbers.split(",")])
+
+def map_cdd_domains(domain, cdd_data):
+    return f"{domain} ({cdd_data.get(domain.split('.')[0], 'Unknown')})"
+
+def infer_go_from_pfam(pfam_ids, pfam_to_go, go_terms):
+    inferred_go = set()
+    for pfam in pfam_ids.split(","):
+        inferred_go.update(pfam_to_go.get(pfam, []))
+    return ";".join([f"{gid} ({go_terms.get(gid, 'Unknown')})" for gid in inferred_go]) if inferred_go else None
+
+def map_pathways(kegg_ids, pathways):
+    return ";".join([f"{kid} ({pathways.get(kid.split(':')[-1], 'Unknown')})" for kid in kegg_ids.split(",")])
+
 def extract_statistics(config, args, annotations_file):
+    """Extract and save statistics."""
     stats_dir = config["output"]["stats_dir"]
     os.makedirs(stats_dir, exist_ok=True)
     checkpoint_file = os.path.join(stats_dir, "stats.done")
@@ -553,7 +524,6 @@ def extract_statistics(config, args, annotations_file):
         return
 
     df = pd.read_csv(annotations_file, sep="\t")
-
     stats = {
         "total_sequences": len(df["qseqid"].unique()),
         "with_protein": len(df[df["protein"].notna()]["qseqid"].unique()),
@@ -576,36 +546,25 @@ def extract_statistics(config, args, annotations_file):
     logging.info(f"Statistics saved to {stats_dir}/stats.txt")
 
 def main():
+    """Main execution logic."""
     args = parse_arguments()
     config = load_config(os.getcwd())
-    
-
     check_files(config, args)
 
-    diamond_out = None
-    blastn_out = None
-    rpstblastn_out = None
     output_dir = config["output"]["dir"]
-    annotations_file = None
+    os.makedirs(output_dir, exist_ok=True)
+    diamond_out_files, blastn_out, rpstblastn_out = [], None, None
 
     if args.do_execute_programs:
-        os.makedirs(output_dir, exist_ok=True)
         tasks = []
         db_map = {"sprot": "uniprot_sprot", "trembl": "uniprot_trembl", "uniref90": "uniref90"}
-        diamond_out_files = []
-
         total_tasks = sum([args.do_blastx * len(args.db_option), args.do_blastn, args.do_rpstblastn])
         threads_per_task = max(1, args.threads // max(1, total_tasks))
 
         if args.do_blastx:
             for db_option in args.db_option:
-                db_name = db_map[db_option]
-                db_index = build_index(
-                    os.path.join(args.db_dir, config["database"][db_name]),
-                    os.path.join(args.db_dir, db_name),
-                    "diamond",
-                    threads_per_task
-                )
+                db_index = build_index(os.path.join(args.db_dir, config["database"][db_map[db_option]]),
+                                      os.path.join(args.db_dir, db_option), "diamond", threads_per_task)
                 diamond_out_file = os.path.join(output_dir, f"{db_option}_{config['output']['diamond_out']}")
                 tasks.append(("diamond", config, args, db_index, diamond_out_file,
                               os.path.join(output_dir, f"{db_option}_diamond.done"), threads_per_task))
@@ -614,70 +573,55 @@ def main():
         if args.do_blastn:
             nc_index = build_index(os.path.join(args.db_dir, config["database"]["ncRNA"]),
                                    os.path.join(args.db_dir, "ncRNA"), "blast", threads_per_task)
-            blastn_out_file = os.path.join(output_dir, config["output"]["blastn_out"])
-            tasks.append(("blastn", config, args, nc_index, blastn_out_file,
+            blastn_out = os.path.join(output_dir, config["output"]["blastn_out"])
+            tasks.append(("blastn", config, args, nc_index, blastn_out,
                           os.path.join(output_dir, "blastn.done"), threads_per_task))
-            blastn_out = blastn_out_file
 
         if args.do_rpstblastn:
             cdd_dir = os.path.join(args.db_dir, "cdd")
             if not os.path.exists(cdd_dir):
                 os.makedirs(cdd_dir)
                 subprocess.run(["tar", "-xzf", os.path.join(args.db_dir, config["database"]["cdd"]), "-C", cdd_dir], check=True)
-            rpstblastn_out_file = os.path.join(output_dir, config["output"]["rpstblastn_out"])
-            tasks.append(("rpstblastn", config, args, os.path.join(cdd_dir, "Cdd"), rpstblastn_out_file,
+            rpstblastn_out = os.path.join(output_dir, config["output"]["rpstblastn_out"])
+            tasks.append(("rpstblastn", config, args, os.path.join(cdd_dir, "Cdd"), rpstblastn_out,
                           os.path.join(output_dir, "rpstblastn.done"), threads_per_task))
-            rpstblastn_out = rpstblastn_out_file
 
         if tasks:
             with Pool(processes=min(len(tasks), args.threads)) as pool:
                 results = pool.map(run_alignment, tasks)
-            diamond_out = [r for r in results if "diamond" in r] or diamond_out_files
-            blastn_out = blastn_out or next((r for r in results if "blastn" in r), None)
-            rpstblastn_out = rpstblastn_out or next((r for r in results if "rpstblastn" in r), None)
+            diamond_out_files = [r for r in results if "diamond" in r] or diamond_out_files
+            blastn_out = next((r for r in results if "blastn" in r), blastn_out)
+            rpstblastn_out = next((r for r in results if "rpstblastn" in r), rpstblastn_out)
 
-        if args.do_lnc_prediction and diamond_out and blastn_out:
-            predict_lncRNA(config, args, diamond_out, blastn_out)
+        if args.do_lnc_prediction and diamond_out_files and blastn_out:
+            predict_lncRNA(config, args, diamond_out_files, blastn_out)
         if args.do_dna2pep:
             dna2pep(config, args)
 
     if args.do_build_output or args.extract_stats:
-        os.makedirs(output_dir, exist_ok=True)
-
-        if not diamond_out:
-            diamond_out = glob.glob(os.path.join(output_dir, "*_diamond.out"))
-            if not diamond_out:
-                logging.error(f"No DIAMOND output files found in {output_dir}")
+        if not diamond_out_files:
+            diamond_out_files = glob.glob(os.path.join(output_dir, "*_diamond.out"))
+            if not diamond_out_files:
                 raise FileNotFoundError(f"No DIAMOND output files found in {output_dir}")
-            logging.info(f"Detected DIAMOND output files: {diamond_out}")
+            logging.info(f"Detected DIAMOND output files: {diamond_out_files}")
 
-        if not blastn_out:
+        if not blastn_out and os.path.exists(os.path.join(output_dir, config["output"]["blastn_out"])):
             blastn_out = os.path.join(output_dir, config["output"]["blastn_out"])
-            if not os.path.exists(blastn_out):
-                logging.warning(f"BLASTN output file not found: {blastn_out}. Proceeding without it.")
-                blastn_out = None
-            else:
-                logging.info(f"Detected BLASTN output file: {blastn_out}")
+            logging.info(f"Detected BLASTN output file: {blastn_out}")
 
-        if not rpstblastn_out:
+        if not rpstblastn_out and os.path.exists(os.path.join(output_dir, config["output"]["rpstblastn_out"])):
             rpstblastn_out = os.path.join(output_dir, config["output"]["rpstblastn_out"])
-            if not os.path.exists(rpstblastn_out):
-                logging.warning(f"RPS-BLASTN output file not found: {rpstblastn_out}. Proceeding without it.")
-                rpstblastn_out = None
-            else:
-                logging.info(f"Detected RPS-BLASTN output file: {rpstblastn_out}")
+            logging.info(f"Detected RPS-BLASTN output file: {rpstblastn_out}")
 
         if args.do_build_output:
             idmapping_parquet = prepare_idmapping(config, args)
-            annotations_file = build_output(config, args, diamond_out, blastn_out, rpstblastn_out, idmapping_parquet)
+            annotations_file = build_output(config, args, diamond_out_files, blastn_out, rpstblastn_out, idmapping_parquet)
+        else:
+            annotations_file = os.path.join(output_dir, config["output"]["annotations"])
 
         if args.extract_stats:
-            if not annotations_file:
-                annotations_file = os.path.join(output_dir, config["output"]["annotations"])
-                if not os.path.exists(annotations_file):
-                    logging.error(f"Annotations file not found: {annotations_file}")
-                    raise FileNotFoundError(f"Annotations file not found: {annotations_file}")
-                logging.info(f"Detected annotations file: {annotations_file}")
+            if not os.path.exists(annotations_file):
+                raise FileNotFoundError(f"Annotations file not found: {annotations_file}")
             extract_statistics(config, args, annotations_file)
 
 if __name__ == "__main__":
