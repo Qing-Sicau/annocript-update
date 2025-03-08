@@ -128,24 +128,43 @@ def check_files(config, args):
     logging.info("All required database files found.")
 
 def build_index(db_file, output_db, tool, threads):
+    """Build index for alignment tools."""
     db_file = os.path.abspath(db_file)
-    uncompressed = output_db + ".fasta"
+    output_db = os.path.abspath(output_db)
+
+    if not os.path.exists(db_file):
+        raise FileNotFoundError(f"Database file not found: {db_file}")
+
     if db_file.endswith(".gz"):
-        uncompressed = pre_uncompress_if_needed(db_file, uncompressed)
+        uncompressed = output_db + ".fasta"
+        if not os.path.exists(uncompressed):
+            with gzip.open(db_file, "rb") as f_in, open(uncompressed, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            logging.info(f"Uncompressed {db_file} to {uncompressed}")
         db_file = uncompressed
 
-    index_file = f"{output_db}.dmnd" if tool == "diamond" else f"{output_db}.00.nhr"
-    if os.path.exists(index_file) and os.path.getmtime(index_file) > os.path.getmtime(db_file):
-        logging.info(f"Index up-to-date: {index_file}")
+    if tool == "diamond":
+        index_file = f"{output_db}.dmnd"
+    elif tool == "blast":
+        index_file = f"{output_db}.00.nhr"
+    else:
+        raise ValueError(f"Unsupported tool: {tool}")
+
+    logging.info(f"Checking index file: {index_file}, exists: {os.path.exists(index_file)}")
+
+    if os.path.exists(index_file):
+        logging.info(f"Index already exists and is up-to-date: {index_file}")
         return output_db
 
-    cmd = (
-        ["diamond", "makedb", "--in", db_file, "--db", output_db, "--threads", str(threads)]
-        if tool == "diamond"
-        else ["makeblastdb", "-in", db_file, "-dbtype", "nucl", "-out", output_db]
-    )
-    subprocess.run(cmd, check=True)
-    logging.info(f"{tool} index built: {index_file}")
+    if tool == "diamond":
+        cmd = ["diamond", "makedb", "--in", db_file, "--db", output_db, "--threads", str(threads)]
+        subprocess.run(cmd, check=True)
+        logging.info(f"DIAMOND index built: {output_db}.dmnd")
+    elif tool == "blast":
+        cmd = ["makeblastdb", "-in", db_file, "-dbtype", "nucl", "-out", output_db]
+        subprocess.run(cmd, check=True)
+        logging.info(f"BLAST index built: {output_db}")
+
     return output_db
 
 def run_alignment(args_tuple):
