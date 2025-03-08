@@ -23,7 +23,7 @@ All scripts were generated using Grok.
 
 ``conda install -c bioconda diamond blast transdecoder pyarrow``
 
-``pip install pyyaml pandas biopython``
+``install pandas dask duckdb pyfaidx biopython pyyaml``
 
 ### mysql configuration
 
