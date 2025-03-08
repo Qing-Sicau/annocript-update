@@ -241,7 +241,7 @@ def dna2pep(config, args):
     return orf_file
 
 def prepare_idmapping(config, args):
-    """Prepare ID mapping file in Parquet format."""
+    """Prepare ID mapping file in Parquet format by processing it in chunks."""
     db_dir = args.db_dir
     idmapping_gz = os.path.join(db_dir, config["database"]["idmapping"])
     idmapping_parquet = os.path.join(db_dir, "idmapping.parquet")
@@ -250,8 +250,30 @@ def prepare_idmapping(config, args):
         logging.info(f"ID mapping already prepared: {idmapping_parquet}")
         return idmapping_parquet
 
-    df = pd.read_csv(idmapping_gz, sep="\t", header=None, names=["uniprot_id", "type", "value"], compression="gzip")
-    df.to_parquet(idmapping_parquet)
+    # Define chunk size (e.g., 1 million rows per chunk)
+    chunk_size = 1_000_000
+    first_chunk = True
+
+    # Read the gzipped file in chunks and write to Parquet
+    for chunk in pd.read_csv(
+        idmapping_gz,
+        sep="\t",
+        header=None,
+        names=["uniprot_id", "type", "value"],
+        compression="gzip",
+        chunksize=chunk_size
+    ):
+        # Write the chunk to Parquet; use 'append' mode after the first chunk
+        chunk.to_parquet(
+            idmapping_parquet,
+            index=False,
+            compression="snappy",
+            engine="pyarrow",
+            append=not first_chunk
+        )
+        first_chunk = False
+        logging.info(f"Processed chunk of {len(chunk)} rows")
+
     logging.info(f"ID mapping prepared: {idmapping_parquet}")
     return idmapping_parquet
 
