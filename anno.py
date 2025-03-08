@@ -145,7 +145,7 @@ def build_index(db_file, output_db, tool, threads):
     if tool == "diamond":
         index_file = f"{output_db}.dmnd"
     elif tool == "blast":
-        index_file = f"{output_db}.nhr"
+        index_file = f"{output_db}.00.nhr"
     else:
         raise ValueError(f"Unsupported tool: {tool}")
 
