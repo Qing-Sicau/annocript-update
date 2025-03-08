@@ -13,6 +13,7 @@ this is the AI automated generated project with only minor mamually curation, do
 General point:
 - no downloading process, download all database files by your self.
 - use diamond to substitute blastp
+- no mysql
 
 All scripts were generated using Grok.
 
@@ -25,13 +26,11 @@ All scripts were generated using Grok.
 
 ``install pandas dask duckdb pyfaidx biopython pyyaml``
 
-### mysql configuration
-
 git all content from this repo
 ``mkdir ./database``
 ### data preparation
 - put all your downloaded databses files into this directory.
-- from CPAT https://cpat.readthedocs.io/en/latest/, download Arabidopsis_hexamer.tsv and Arabidopsis_logit.RData, move into ./databases/
+\#\#- from CPAT https://cpat.readthedocs.io/en/latest/, download Arabidopsis_hexamer.tsv and Arabidopsis_logit.RData, move into ./databases/
 ## annotate your fasta
 - before formal run,
   ```bash
