@@ -13,7 +13,6 @@ this is the AI automated generated project with only minor mamually curation, do
 General point:
 - no downloading process, download all database files by your self.
 - use diamond to substitute blastp
-- avoid using mysql, for its complex, and unknown trouble
 
 All scripts were generated using Grok.
 
@@ -22,9 +21,11 @@ All scripts were generated using Grok.
 
 ``conda activate annocript``
 
-``conda install -c bioconda diamond blast cpat transdecoder``
+``conda install -c bioconda diamond blast transdecoder``
 
-``pip install pyyaml pandas duckdb biopython``
+``pip install pyyaml pandas biopython``
+
+### mysql configuration
 
 git all content from this repo
 ``mkdir ./database``
