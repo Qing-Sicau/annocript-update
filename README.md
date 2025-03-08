@@ -21,7 +21,7 @@ All scripts were generated using Grok.
 
 ``conda activate annocript``
 
-``conda install -c bioconda diamond blast transdecoder``
+``conda install -c bioconda diamond blast transdecoder pyarrow``
 
 ``pip install pyyaml pandas biopython``
 
