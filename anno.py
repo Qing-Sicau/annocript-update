@@ -250,29 +250,41 @@ def prepare_idmapping(config, args):
         logging.info(f"ID mapping already prepared: {idmapping_parquet}")
         return idmapping_parquet
 
-    # Define chunk size (e.g., 1 million rows per chunk)
+    # Define chunk size (adjust based on your memory constraints)
     chunk_size = 1_000_000
-    first_chunk = True
+    schema = None  # To store the schema for consistency across chunks
+    writer = None  # Parquet writer object
 
-    # Read the gzipped file in chunks and write to Parquet
-    for chunk in pd.read_csv(
-        idmapping_gz,
-        sep="\t",
-        header=None,
-        names=["uniprot_id", "type", "value"],
-        compression="gzip",
-        chunksize=chunk_size
-    ):
-        # Write the chunk to Parquet; use 'append' mode after the first chunk
-        chunk.to_parquet(
-            idmapping_parquet,
-            index=False,
-            compression="snappy",
-            engine="pyarrow",
-            append=not first_chunk
-        )
-        first_chunk = False
-        logging.info(f"Processed chunk of {len(chunk)} rows")
+    try:
+        # Read the gzipped file in chunks
+        for i, chunk in enumerate(pd.read_csv(
+            idmapping_gz,
+            sep="\t",
+            header=None,
+            names=["uniprot_id", "type", "value"],
+            dtype=str,  # Force all columns to be strings to avoid mixed types
+            compression="gzip",
+            chunksize=chunk_size
+        )):
+            # Convert chunk to pyarrow Table
+            table = pa.Table.from_pandas(chunk)
+
+            if i == 0:
+                # Initialize the Parquet writer with the schema from the first chunk
+                schema = table.schema
+                writer = pq.ParquetWriter(idmapping_parquet, schema, compression="snappy")
+                writer.write_table(table)
+            else:
+                # Ensure subsequent chunks match the schema
+                table = table.cast(schema)
+                writer.write_table(table)
+
+            logging.info(f"Processed chunk {i + 1} with {len(chunk)} rows")
+
+    finally:
+        # Close the writer to ensure the file is properly finalized
+        if writer:
+            writer.close()
 
     logging.info(f"ID mapping prepared: {idmapping_parquet}")
     return idmapping_parquet
